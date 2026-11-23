@@ -5,12 +5,15 @@
 // are noisy, so this bot does not chase crosses. It takes the trend from
 // one slow EMA of the closes, buys only when the price holds above that
 // EMA with the EMA itself rising and an hour of momentum behind it, and
-// then stays in through the noise: it leaves on a decisive break under
-// the EMA, a wide trailing stop or a hard stop, nothing twitchier. Risk
-// is capped three ways: one position at a time, a cooldown after every
+// then stays in through the noise: the only ways out are a wide trailing
+// stop, a hard stop, or the drawdown halt below, so a position is not
+// shaken out by the pullbacks every real trend is made of. Risk is
+// capped three ways: one position at a time, a cooldown after every
 // exit so a choppy patch cannot machine-gun the fees, and an equity
 // drawdown halt that parks the bot in cash for the rest of the window
-// once it has given back too much from its peak.
+// once it has given back too much from its peak. If no trend has offered
+// an entry by late in the window, one probe entry on a strong one-hour
+// bounce keeps the bot in the race without forcing a trade earlier.
 //
 // Everything is decided from the bars in each batch and the account the
 // harness reports: no clock, no randomness, no environment, so two runs
@@ -18,19 +21,15 @@
 
 import { runBars, type BarsState, type Batch, type OrderInput } from './vendor/makefun-bars.ts';
 
-/** The trend EMA's span in bars: three hours of one-minute closes. */
-const TREND_SPAN = 180;
+/** The trend EMA's span in bars: two hours of one-minute closes. */
+const TREND_SPAN = 120;
 /** Momentum is the return over this many bars, in bps. */
 const MOM_BARS = 60;
-const MOM_MIN_BPS = 15;
-/** Entry needs the close at least this far above the trend EMA, in bps. */
-const ENTRY_LEAD_BPS = 5;
-/** Exit on trend only once the close is this far under the EMA, in bps. */
-const EXIT_LAG_BPS = 40;
+const MOM_MIN_BPS = 10;
 /** Leave a position once the close falls this far under its best close. */
-const TRAIL_BPS = 200;
+const TRAIL_BPS = 280;
 /** Hard stop: this far under the price the position actually filled at. */
-const STOP_BPS = 250;
+const STOP_BPS = 350;
 /** Bars to sit out after an exit before any new entry. */
 const COOLDOWN_BARS = 30;
 /** A fresh entry signal stays usable for this many bars. */
@@ -45,6 +44,12 @@ const BUY_SLIPPAGE_BPS = 60;
 const SELL_SLIPPAGE_BPS = 100;
 /** No fresh entries this close to the end of a 1,440-bar window. */
 const LAST_ENTRY_SEQ = 1400;
+/** The late probe: from this seq, if nothing has traded yet, a strong
+ * one-hour bounce (close over its 30-bar EMA, momentum at least this
+ * many bps) earns one entry under the usual exits. */
+const PROBE_SEQ = 900;
+const PROBE_SPAN = 30;
+const PROBE_MOM_MIN_BPS = 20;
 
 /** One EMA: the closes it collects until it starts, then its value. */
 interface Ema {
@@ -72,6 +77,8 @@ function stepEma(e: Ema, close: number): void {
 // the hello, so nothing here hardcodes a ticker.
 let symbol = '';
 const trend = makeEma(TREND_SPAN);
+/** The probe's short EMA, used only by the late-window fallback entry. */
+const probe = makeEma(PROBE_SPAN);
 /** Recent closes, oldest first, enough for the momentum lookback. */
 const closes: number[] = [];
 /** Recent trend EMA values, oldest first, to tell whether it is rising. */
@@ -93,6 +100,8 @@ let peakClose = 0;
 /** Highest equity seen, and the halt it arms. */
 let peakEquity = 0n;
 let halted = false;
+/** Whether any buy has filled yet this window (arms the late probe). */
+let everTraded = false;
 
 /** The entry signal on the latest close: above a rising trend with momentum. */
 function signalNow(close: number): boolean {
@@ -101,17 +110,12 @@ function signalNow(close: number): boolean {
   const back = closes[closes.length - 1 - MOM_BARS]!;
   const momentumBps = ((close - back) / back) * 10_000;
   const emaBack = trendHist[trendHist.length - 1 - MOM_BARS / 2]!;
-  return (
-    close >= trend.value * (1 + ENTRY_LEAD_BPS / 10_000) &&
-    momentumBps >= MOM_MIN_BPS &&
-    trend.value > emaBack
-  );
+  return close >= trend.value && momentumBps >= MOM_MIN_BPS && trend.value > emaBack;
 }
 
 /** Whether the open position should be sold on this close. */
 function exitNow(close: number): boolean {
   if (halted) return true;
-  if (trend.value !== null && close <= trend.value * (1 - EXIT_LAG_BPS / 10_000)) return true;
   if (peakClose > 0 && close <= peakClose * (1 - TRAIL_BPS / 10_000)) return true;
   if (entryPrice > 0 && close <= entryPrice * (1 - STOP_BPS / 10_000)) return true;
   return false;
@@ -132,6 +136,7 @@ await runBars({
       if (fill.status === 'filled' && fill.side === 'buy') {
         entryPrice = Number(fill.price);
         peakClose = entryPrice;
+        everTraded = true;
       }
     }
 
@@ -142,6 +147,7 @@ await runBars({
       closes.push(close);
       if (closes.length > MOM_BARS + 1) closes.shift();
       stepEma(trend, close);
+      stepEma(probe, close);
       if (trend.value !== null) {
         trendHist.push(trend.value);
         if (trendHist.length > MOM_BARS / 2 + 1) trendHist.shift();
@@ -179,10 +185,17 @@ await runBars({
 
     // Entry: a fresh signal, inside its window, past the cooldown, with
     // no buy still in flight and enough of the window left to matter.
+    // Failing that, the late probe: nothing traded yet, the window is
+    // well along, and a strong one-hour bounce is under way.
     const fresh = signal && batch.seq - signalSeq <= ENTRY_WINDOW_BARS;
     const cooled = batch.seq - lastExitSeq >= COOLDOWN_BARS;
     const inFlight = batch.seq - lastBuySeq < 2;
-    if (!fresh || !cooled || inFlight || batch.seq > LAST_ENTRY_SEQ) return [];
+    let probeOk = false;
+    if (!everTraded && batch.seq >= PROBE_SEQ && probe.value !== null && closes.length > MOM_BARS) {
+      const back = closes[closes.length - 1 - MOM_BARS]!;
+      probeOk = close > probe.value && ((close - back) / back) * 10_000 >= PROBE_MOM_MIN_BPS;
+    }
+    if ((!fresh && !probeOk) || !cooled || inFlight || batch.seq > LAST_ENTRY_SEQ) return [];
     const spend = (state.cash * SPEND_NUM) / SPEND_DEN;
     if (spend < BigInt(state.hello.fees.min_notional_quote_units)) return [];
     lastBuySeq = batch.seq;
