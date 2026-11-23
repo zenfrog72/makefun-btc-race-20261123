@@ -1,15 +1,16 @@
 // Trend rider for the cbBTC 24h bars race (agent-fun/bars-replay/v1).
 //
 // Idea in one paragraph: on a thin on-chain pool a full round trip costs
-// roughly 26-35 bps in fees, slippage and price impact, so this bot only
-// trades when a move is already under way and big enough to pay for the
-// trip. It follows the trend of the minute bars with two EMAs, asks a
-// 30-bar momentum check to confirm the move, rides the position while the
-// trend holds, and gets out on a trend break, a trailing stop or a hard
-// stop. Risk is capped three ways: one position at a time, a cooldown
-// after every exit so a choppy patch cannot machine-gun the fees, and an
-// equity drawdown halt that parks the bot in cash for the rest of the
-// window once it has given back too much from its peak.
+// roughly 26-35 bps in fees, slippage and price impact, and minute bars
+// are noisy, so this bot does not chase crosses. It takes the trend from
+// one slow EMA of the closes, buys only when the price holds above that
+// EMA with the EMA itself rising and an hour of momentum behind it, and
+// then stays in through the noise: it leaves on a decisive break under
+// the EMA, a wide trailing stop or a hard stop, nothing twitchier. Risk
+// is capped three ways: one position at a time, a cooldown after every
+// exit so a choppy patch cannot machine-gun the fees, and an equity
+// drawdown halt that parks the bot in cash for the rest of the window
+// once it has given back too much from its peak.
 //
 // Everything is decided from the bars in each batch and the account the
 // harness reports: no clock, no randomness, no environment, so two runs
@@ -17,22 +18,23 @@
 
 import { runBars, type BarsState, type Batch, type OrderInput } from './vendor/makefun-bars.ts';
 
-/** EMA spans, in bars: a quarter hour against an hour. */
-const FAST_SPAN = 15;
-const SLOW_SPAN = 60;
+/** The trend EMA's span in bars: three hours of one-minute closes. */
+const TREND_SPAN = 180;
 /** Momentum is the return over this many bars, in bps. */
-const MOM_BARS = 30;
-const MOM_MIN_BPS = 10;
-/** The fast EMA must lead the slow one by at least this much, in bps. */
-const SPREAD_MIN_BPS = 3;
+const MOM_BARS = 60;
+const MOM_MIN_BPS = 15;
+/** Entry needs the close at least this far above the trend EMA, in bps. */
+const ENTRY_LEAD_BPS = 5;
+/** Exit on trend only once the close is this far under the EMA, in bps. */
+const EXIT_LAG_BPS = 40;
 /** Leave a position once the close falls this far under its best close. */
-const TRAIL_BPS = 110;
+const TRAIL_BPS = 200;
 /** Hard stop: this far under the price the position actually filled at. */
-const STOP_BPS = 140;
+const STOP_BPS = 250;
 /** Bars to sit out after an exit before any new entry. */
-const COOLDOWN_BARS = 15;
+const COOLDOWN_BARS = 30;
 /** A fresh entry signal stays usable for this many bars. */
-const ENTRY_WINDOW_BARS = 6;
+const ENTRY_WINDOW_BARS = 10;
 /** Equity drawdown from its peak that halts trading for the window. */
 const HALT_DRAWDOWN = 0.08;
 /** Share of the cash a buy spends (the fee comes out of the notional). */
@@ -69,11 +71,12 @@ function stepEma(e: Ema, close: number): void {
 // The traded symbol is the universe's only symbol; its name arrives in
 // the hello, so nothing here hardcodes a ticker.
 let symbol = '';
-const fast = makeEma(FAST_SPAN);
-const slow = makeEma(SLOW_SPAN);
+const trend = makeEma(TREND_SPAN);
 /** Recent closes, oldest first, enough for the momentum lookback. */
 const closes: number[] = [];
-/** Whether the entry signal (trend up, spread and momentum met) held after the previous bar. */
+/** Recent trend EMA values, oldest first, to tell whether it is rising. */
+const trendHist: number[] = [];
+/** Whether the entry signal held after the previous bar. */
 let signalWas = false;
 /** Seq of the batch where the current fresh signal began. */
 let signalSeq = -1;
@@ -91,20 +94,24 @@ let peakClose = 0;
 let peakEquity = 0n;
 let halted = false;
 
-/** The entry signal on the latest close: trend up with room and momentum. */
+/** The entry signal on the latest close: above a rising trend with momentum. */
 function signalNow(close: number): boolean {
-  if (fast.value === null || slow.value === null) return false;
-  if (closes.length <= MOM_BARS) return false;
+  if (trend.value === null || closes.length <= MOM_BARS) return false;
+  if (trendHist.length <= MOM_BARS / 2) return false;
   const back = closes[closes.length - 1 - MOM_BARS]!;
   const momentumBps = ((close - back) / back) * 10_000;
-  const spreadBps = ((fast.value - slow.value) / slow.value) * 10_000;
-  return fast.value > slow.value && spreadBps >= SPREAD_MIN_BPS && momentumBps >= MOM_MIN_BPS;
+  const emaBack = trendHist[trendHist.length - 1 - MOM_BARS / 2]!;
+  return (
+    close >= trend.value * (1 + ENTRY_LEAD_BPS / 10_000) &&
+    momentumBps >= MOM_MIN_BPS &&
+    trend.value > emaBack
+  );
 }
 
 /** Whether the open position should be sold on this close. */
 function exitNow(close: number): boolean {
   if (halted) return true;
-  if (fast.value !== null && slow.value !== null && fast.value < slow.value) return true;
+  if (trend.value !== null && close <= trend.value * (1 - EXIT_LAG_BPS / 10_000)) return true;
   if (peakClose > 0 && close <= peakClose * (1 - TRAIL_BPS / 10_000)) return true;
   if (entryPrice > 0 && close <= entryPrice * (1 - STOP_BPS / 10_000)) return true;
   return false;
@@ -134,8 +141,11 @@ await runBars({
       close = Number(bar.c);
       closes.push(close);
       if (closes.length > MOM_BARS + 1) closes.shift();
-      stepEma(fast, close);
-      stepEma(slow, close);
+      stepEma(trend, close);
+      if (trend.value !== null) {
+        trendHist.push(trend.value);
+        if (trendHist.length > MOM_BARS / 2 + 1) trendHist.shift();
+      }
     }
 
     if (state.equity > peakEquity) peakEquity = state.equity;
